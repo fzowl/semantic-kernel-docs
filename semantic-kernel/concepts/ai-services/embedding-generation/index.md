@@ -661,9 +661,6 @@ public sealed class VoyageEmbeddingGenerator : IEmbeddingGenerator<string, Embed
         _http = httpClient ?? new HttpClient();
     }
 
-    /// <summary>The base URL that requests are sent to.</summary>
-    public Uri BaseUri => _baseUri;
-
     public async Task<GeneratedEmbeddings<Embedding<float>>> GenerateAsync(
         IEnumerable<string> values,
         EmbeddingGenerationOptions? options = null,
