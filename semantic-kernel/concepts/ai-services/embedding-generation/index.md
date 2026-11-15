@@ -901,7 +901,7 @@ Contextualized embeddings return several chunk vectors for each document, and mu
 which returns one vector for each input string. Call the `voyageai` client directly instead.
 
 For contextualized embeddings, always set `input_type="document"`, `enable_auto_chunking=True` and `chunk_size=32_000` when you embed documents, and pass one string for each document.
-Auto-chunking only works with the `document` input type, and a list of chunk lists is rejected. Queries aren't chunked.
+Auto-chunking only works with the `document` input type, and with auto-chunking enabled a list of chunk lists is rejected. Queries aren't chunked.
 The response contains the text of every chunk in `chunk_texts`.
 
 ```python
