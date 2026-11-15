@@ -5,7 +5,7 @@ zone_pivot_groups: programming-languages
 author: westey-m
 ms.topic: article
 ms.author: westey
-ms.date: 11/11/2024
+ms.date: 11/15/2026
 ms.service: semantic-kernel
 ---
 
@@ -605,9 +605,260 @@ ReadOnlyMemory<float> embedding =
     await textEmbeddingGenerationService.GenerateEmbeddingAsync("sample text");
 ```
 
+## Using Voyage AI by MongoDB
+
+Semantic Kernel doesn't include a Voyage AI by MongoDB connector, but it works with any
+[`IEmbeddingGenerator<string, Embedding<float>>`](/dotnet/api/microsoft.extensions.ai.iembeddinggenerator-2) implementation from `Microsoft.Extensions.AI`.
+The following example implements that interface for the [Voyage AI embeddings REST API](https://docs.voyageai.com/reference/embeddings-api).
+Get an API key as described in [Voyage AI API key and installation](https://docs.voyageai.com/docs/api-key-and-installation) and store it in the `VOYAGE_API_KEY` environment variable.
+
+| Model | Context length (tokens) | Output dimensions |
+|-------|-------------------------|-------------------|
+| `voyage-4-large`, `voyage-4`, `voyage-4-lite`, `voyage-code-4` | 32,000 | 1024 (default), 2048, 512, 256 |
+| `voyage-3-large`, `voyage-3.5`, `voyage-3.5-lite`, `voyage-code-3` | 32,000 | 1024 (default), 2048, 512, 256 |
+| `voyage-finance-2` | 32,000 | 1024 |
+| `voyage-law-2` | 16,000 | 1024 |
+
+Each request can contain at most 1,000 inputs. The total number of tokens in one request is also limited per model:
+1,000,000 for `voyage-4-lite` and `voyage-3.5-lite`, 320,000 for `voyage-4` and `voyage-3.5`, and 120,000 for `voyage-4-large`,
+`voyage-3-large`, `voyage-code-3`, `voyage-finance-2` and `voyage-law-2`. See the
+[Voyage AI embeddings documentation](https://docs.voyageai.com/docs/embeddings) for the current list of models and limits.
+
+The `Dimensions` option of `EmbeddingGenerationOptions` sets `output_dimension`, and is only sent when you set it.
+API keys that start with `al-` use `https://ai.mongodb.com/v1` by default, and all other keys use `https://api.voyageai.com/v1`.
+A base URL that you pass to the constructor is always used instead.
+
+```csharp
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Microsoft.Extensions.AI;
+
+/// <summary>Embedding generator for Voyage AI by MongoDB, calling the REST API directly.</summary>
+public sealed class VoyageEmbeddingGenerator : IEmbeddingGenerator<string, Embedding<float>>
+{
+    private readonly HttpClient _http;
+    private readonly string _modelId;
+
+    public VoyageEmbeddingGenerator(string apiKey, string modelId, string? baseUrl = null, HttpClient? httpClient = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(apiKey);
+        ArgumentException.ThrowIfNullOrWhiteSpace(modelId);
+
+        // An explicit base URL wins; otherwise the host depends on the API key prefix.
+        baseUrl ??= apiKey.StartsWith("al-", StringComparison.Ordinal)
+            ? "https://ai.mongodb.com/v1"
+            : "https://api.voyageai.com/v1";
+
+        _modelId = modelId;
+        _http = httpClient ?? new HttpClient();
+        _http.BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/");
+        _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+    }
+
+    public async Task<GeneratedEmbeddings<Embedding<float>>> GenerateAsync(
+        IEnumerable<string> values,
+        EmbeddingGenerationOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        // The API accepts at most 1,000 inputs per request.
+        var request = new
+        {
+            input = values.ToList(),
+            model = options?.ModelId ?? _modelId,
+            output_dimension = options?.Dimensions,
+        };
+
+        using var response = await _http.PostAsJsonAsync("embeddings", request, JsonOptions, cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            // Voyage AI returns errors as {"detail": "<message>"}.
+            var error = await response.Content.ReadFromJsonAsync<ErrorBody>(cancellationToken);
+            throw new HttpRequestException(
+                $"Voyage AI request failed ({(int)response.StatusCode}): {error?.Detail}");
+        }
+
+        var body = await response.Content.ReadFromJsonAsync<EmbeddingsBody>(cancellationToken)
+            ?? throw new InvalidOperationException("Voyage AI returned an empty response.");
+
+        return new GeneratedEmbeddings<Embedding<float>>(
+            body.Data.OrderBy(d => d.Index).Select(d => new Embedding<float>(d.Embedding)).ToList());
+    }
+
+    public object? GetService(Type serviceType, object? serviceKey = null) =>
+        serviceKey is null && serviceType.IsInstanceOfType(this) ? this : null;
+
+    public void Dispose() => _http.Dispose();
+
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    };
+
+    private sealed record ErrorBody([property: JsonPropertyName("detail")] string? Detail);
+
+    private sealed record EmbeddingsBody([property: JsonPropertyName("data")] List<Item> Data);
+
+    private sealed record Item(
+        [property: JsonPropertyName("index")] int Index,
+        [property: JsonPropertyName("embedding")] float[] Embedding);
+}
+```
+
+Register the generator with the kernel builder, then use it as you would any other embedding generator.
+
+```csharp
+using Microsoft.Extensions.AI;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.SemanticKernel;
+
+var builder = Kernel.CreateBuilder();
+builder.Services.AddSingleton<IEmbeddingGenerator<string, Embedding<float>>>(
+    new VoyageEmbeddingGenerator(
+        Environment.GetEnvironmentVariable("VOYAGE_API_KEY")!,
+        modelId: "voyage-4-large"));
+Kernel kernel = builder.Build();
+
+var generator = kernel.GetRequiredService<IEmbeddingGenerator<string, Embedding<float>>>();
+GeneratedEmbeddings<Embedding<float>> embeddings = await generator.GenerateAsync(["sample text 1", "sample text 2"]);
+```
+
 ::: zone-end
 
 ::: zone pivot="programming-language-python"
+
+## Using Voyage AI by MongoDB
+
+Semantic Kernel doesn't include a Voyage AI by MongoDB connector, but you can add one by deriving from `EmbeddingGeneratorBase`.
+The following example uses the official [`voyageai`](https://pypi.org/project/voyageai/) package. Install it with `pip install semantic-kernel "voyageai>=0.3.7"`,
+get an API key as described in [Voyage AI API key and installation](https://docs.voyageai.com/docs/api-key-and-installation), and store it in the `VOYAGE_API_KEY` environment variable.
+
+| Model | Context length (tokens) | Output dimensions |
+|-------|-------------------------|-------------------|
+| `voyage-4-large`, `voyage-4`, `voyage-4-lite`, `voyage-code-4` | 32,000 | 1024 (default), 2048, 512, 256 |
+| `voyage-3-large`, `voyage-3.5`, `voyage-3.5-lite`, `voyage-code-3` | 32,000 | 1024 (default), 2048, 512, 256 |
+| `voyage-finance-2` | 32,000 | 1024 |
+| `voyage-law-2` | 16,000 | 1024 |
+
+Each request can contain at most 1,000 inputs. The total number of tokens in one request is also limited per model:
+1,000,000 for `voyage-4-lite` and `voyage-3.5-lite`, 320,000 for `voyage-4` and `voyage-3.5`, and 120,000 for `voyage-4-large`,
+`voyage-3-large`, `voyage-code-3`, `voyage-finance-2` and `voyage-law-2`. See the
+[Voyage AI embeddings documentation](https://docs.voyageai.com/docs/embeddings) for the current list of models and limits.
+
+The example counts tokens with the `voyageai` tokenizer and splits the inputs into several requests when they exceed these limits.
+The embeddings are returned in the order of the inputs. Models that aren't in the `MAX_TOKENS_PER_REQUEST` table are rejected.
+`voyage-code-4` has no documented token limit, so only the 1,000 input limit applies to it.
+API keys that start with `al-` use `https://ai.mongodb.com/v1` by default, and all other keys use `https://api.voyageai.com/v1`.
+This is handled by the `voyageai` package, and a `base_url` that you pass is always used instead.
+
+```python
+from typing import Any
+
+import numpy as np
+import voyageai
+from numpy import ndarray
+from pydantic import PrivateAttr
+
+from semantic_kernel.connectors.ai.embedding_generator_base import EmbeddingGeneratorBase
+from semantic_kernel.connectors.ai.prompt_execution_settings import PromptExecutionSettings
+
+# Maximum number of inputs in one request.
+MAX_INPUTS_PER_REQUEST = 1000
+
+# Maximum total tokens in one request, per model. None means the model has no documented limit.
+MAX_TOKENS_PER_REQUEST: dict[str, int | None] = {
+    "voyage-4-large": 120_000,
+    "voyage-4": 320_000,
+    "voyage-4-lite": 1_000_000,
+    "voyage-code-4": None,
+    "voyage-3-large": 120_000,
+    "voyage-3.5": 320_000,
+    "voyage-3.5-lite": 1_000_000,
+    "voyage-code-3": 120_000,
+    "voyage-finance-2": 120_000,
+    "voyage-law-2": 120_000,
+}
+
+
+class VoyageTextEmbedding(EmbeddingGeneratorBase):
+    """Text embedding service for Voyage AI by MongoDB, built on the official `voyageai` package."""
+
+    output_dimension: int | None = None
+    _client: voyageai.AsyncClient = PrivateAttr()
+
+    def __init__(
+        self,
+        ai_model_id: str,
+        service_id: str | None = None,
+        output_dimension: int | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        if ai_model_id not in MAX_TOKENS_PER_REQUEST:
+            raise ValueError(f"Unknown Voyage AI model: {ai_model_id}")
+        super().__init__(ai_model_id=ai_model_id, service_id=service_id or ai_model_id, output_dimension=output_dimension)
+        # The API key is read from the VOYAGE_API_KEY environment variable by the client.
+        self._client = voyageai.AsyncClient(base_url=base_url)
+
+    def _batches(self, texts: list[str]) -> list[list[str]]:
+        """Split texts, keeping their order, so that each request respects the model's limits."""
+        max_tokens = MAX_TOKENS_PER_REQUEST[self.ai_model_id]
+        token_counts = (
+            [len(t) for t in self._client.tokenize(texts, self.ai_model_id)] if max_tokens is not None else None
+        )
+        batches: list[list[str]] = []
+        current: list[str] = []
+        current_tokens = 0
+        for index, text in enumerate(texts):
+            tokens = token_counts[index] if token_counts is not None else 0
+            if current and (
+                len(current) == MAX_INPUTS_PER_REQUEST
+                or (max_tokens is not None and current_tokens + tokens > max_tokens)
+            ):
+                batches.append(current)
+                current, current_tokens = [], 0
+            current.append(text)
+            current_tokens += tokens
+        if current:
+            batches.append(current)
+        return batches
+
+    async def generate_embeddings(
+        self,
+        texts: list[str],
+        settings: PromptExecutionSettings | None = None,
+        **kwargs: Any,
+    ) -> ndarray:
+        embeddings: list[list[float]] = []
+        for batch in self._batches(texts):
+            result = await self._client.embed(
+                batch,
+                model=self.ai_model_id,
+                output_dimension=self.output_dimension,
+            )
+            embeddings.extend(result.embeddings)
+        return np.array(embeddings)
+```
+
+Add the service to the kernel, or use it directly.
+
+```python
+import asyncio
+
+from semantic_kernel import Kernel
+
+kernel = Kernel()
+kernel.add_service(VoyageTextEmbedding(ai_model_id="voyage-4-large"))
+
+
+async def main() -> None:
+    service = VoyageTextEmbedding(ai_model_id="voyage-4-large", output_dimension=512)
+    embeddings = await service.generate_embeddings(["sample text 1", "sample text 2"])
+    print(embeddings.shape)  # (2, 512)
+
+
+asyncio.run(main())
+```
 
 ## Coming soon
 
