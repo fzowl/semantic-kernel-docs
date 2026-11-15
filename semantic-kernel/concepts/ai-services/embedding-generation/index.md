@@ -639,6 +639,9 @@ using Microsoft.Extensions.AI;
 public sealed class VoyageEmbeddingGenerator : IEmbeddingGenerator<string, Embedding<float>>
 {
     private readonly HttpClient _http;
+    private readonly bool _disposeHttp;
+    private readonly Uri _baseUri;
+    private readonly string _apiKey;
     private readonly string _modelId;
 
     public VoyageEmbeddingGenerator(string apiKey, string modelId, string? baseUrl = null, HttpClient? httpClient = null)
@@ -651,11 +654,15 @@ public sealed class VoyageEmbeddingGenerator : IEmbeddingGenerator<string, Embed
             ? "https://ai.mongodb.com/v1"
             : "https://api.voyageai.com/v1";
 
+        _apiKey = apiKey;
         _modelId = modelId;
+        _baseUri = new Uri(baseUrl.TrimEnd('/') + "/");
+        _disposeHttp = httpClient is null;
         _http = httpClient ?? new HttpClient();
-        _http.BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/");
-        _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
     }
+
+    /// <summary>The base URL that requests are sent to.</summary>
+    public Uri BaseUri => _baseUri;
 
     public async Task<GeneratedEmbeddings<Embedding<float>>> GenerateAsync(
         IEnumerable<string> values,
@@ -670,13 +677,21 @@ public sealed class VoyageEmbeddingGenerator : IEmbeddingGenerator<string, Embed
             output_dimension = options?.Dimensions,
         };
 
-        using var response = await _http.PostAsJsonAsync("embeddings", request, JsonOptions, cancellationToken);
+        using var message = new HttpRequestMessage(HttpMethod.Post, new Uri(_baseUri, "embeddings"))
+        {
+            Content = JsonContent.Create(request, options: JsonOptions),
+        };
+        message.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+
+        using var response = await _http.SendAsync(message, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
             // Voyage AI returns errors as {"detail": "<message>"}.
-            var error = await response.Content.ReadFromJsonAsync<ErrorBody>(cancellationToken);
+            var text = await response.Content.ReadAsStringAsync(cancellationToken);
             throw new HttpRequestException(
-                $"Voyage AI request failed ({(int)response.StatusCode}): {error?.Detail}");
+                $"Voyage AI request failed ({(int)response.StatusCode}): {ExtractDetail(text)}",
+                inner: null,
+                response.StatusCode);
         }
 
         var body = await response.Content.ReadFromJsonAsync<EmbeddingsBody>(cancellationToken)
@@ -689,7 +704,25 @@ public sealed class VoyageEmbeddingGenerator : IEmbeddingGenerator<string, Embed
     public object? GetService(Type serviceType, object? serviceKey = null) =>
         serviceKey is null && serviceType.IsInstanceOfType(this) ? this : null;
 
-    public void Dispose() => _http.Dispose();
+    public void Dispose()
+    {
+        if (_disposeHttp)
+        {
+            _http.Dispose();
+        }
+    }
+
+    private static string ExtractDetail(string body)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<ErrorBody>(body)?.Detail ?? body;
+        }
+        catch (JsonException)
+        {
+            return body;
+        }
+    }
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -706,7 +739,7 @@ public sealed class VoyageEmbeddingGenerator : IEmbeddingGenerator<string, Embed
 }
 ```
 
-Register the generator with the kernel builder, then use it as you would any other embedding generator.
+Register the generator with the kernel builder, then call its `GenerateAsync` method. Unlike the services above, it implements `IEmbeddingGenerator` and not `ITextEmbeddingGenerationService`.
 
 ```csharp
 using Microsoft.Extensions.AI;
@@ -746,13 +779,14 @@ Each request can contain at most 1,000 inputs. The total number of tokens in one
 `voyage-3-large`, `voyage-code-3`, `voyage-finance-2` and `voyage-law-2`. See the
 [Voyage AI embeddings documentation](https://docs.voyageai.com/docs/embeddings) for the current list of models and limits.
 
-The example counts tokens with the `voyageai` tokenizer and splits the inputs into several requests when they exceed these limits.
+The example counts tokens with the `voyageai` tokenizer (the first call downloads the tokenizer) and splits the inputs into several requests when they exceed these limits.
 The embeddings are returned in the order of the inputs. Models that aren't in the `MAX_TOKENS_PER_REQUEST` table are rejected.
 `voyage-code-4` has no documented token limit, so only the 1,000 input limit applies to it.
 API keys that start with `al-` use `https://ai.mongodb.com/v1` by default, and all other keys use `https://api.voyageai.com/v1`.
 This is handled by the `voyageai` package, and a `base_url` that you pass is always used instead.
 
 ```python
+import asyncio
 from typing import Any
 
 import numpy as np
@@ -800,12 +834,14 @@ class VoyageTextEmbedding(EmbeddingGeneratorBase):
         # The API key is read from the VOYAGE_API_KEY environment variable by the client.
         self._client = voyageai.AsyncClient(base_url=base_url)
 
-    def _batches(self, texts: list[str]) -> list[list[str]]:
+    async def _batches(self, texts: list[str]) -> list[list[str]]:
         """Split texts, keeping their order, so that each request respects the model's limits."""
         max_tokens = MAX_TOKENS_PER_REQUEST[self.ai_model_id]
-        token_counts = (
-            [len(t) for t in self._client.tokenize(texts, self.ai_model_id)] if max_tokens is not None else None
-        )
+        token_counts = None
+        if max_tokens is not None:
+            # The first call downloads the tokenizer, so run it off the event loop.
+            tokenized = await asyncio.to_thread(self._client.tokenize, texts, self.ai_model_id)
+            token_counts = [len(t) for t in tokenized]
         batches: list[list[str]] = []
         current: list[str] = []
         current_tokens = 0
@@ -830,7 +866,7 @@ class VoyageTextEmbedding(EmbeddingGeneratorBase):
         **kwargs: Any,
     ) -> ndarray:
         embeddings: list[list[float]] = []
-        for batch in self._batches(texts):
+        for batch in await self._batches(texts):
             result = await self._client.embed(
                 batch,
                 model=self.ai_model_id,
@@ -840,7 +876,7 @@ class VoyageTextEmbedding(EmbeddingGeneratorBase):
         return np.array(embeddings)
 ```
 
-Add the service to the kernel, or use it directly.
+Add the service to the kernel, then get it from the kernel and use it.
 
 ```python
 import asyncio
@@ -848,11 +884,11 @@ import asyncio
 from semantic_kernel import Kernel
 
 kernel = Kernel()
-kernel.add_service(VoyageTextEmbedding(ai_model_id="voyage-4-large"))
+kernel.add_service(VoyageTextEmbedding(ai_model_id="voyage-4-large", output_dimension=512))
 
 
 async def main() -> None:
-    service = VoyageTextEmbedding(ai_model_id="voyage-4-large", output_dimension=512)
+    service = kernel.get_service(type=VoyageTextEmbedding)
     embeddings = await service.generate_embeddings(["sample text 1", "sample text 2"])
     print(embeddings.shape)  # (2, 512)
 
