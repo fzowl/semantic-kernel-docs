@@ -761,7 +761,7 @@ GeneratedEmbeddings<Embedding<float>> embeddings = await generator.GenerateAsync
 ## Using Voyage AI by MongoDB
 
 Semantic Kernel doesn't include a Voyage AI by MongoDB connector, but you can add one by deriving from `EmbeddingGeneratorBase`.
-The following example uses the official [`voyageai`](https://pypi.org/project/voyageai/) package. Install it with `pip install semantic-kernel "voyageai>=0.3.7"`,
+The following example uses the official [`voyageai`](https://pypi.org/project/voyageai/) package. Install it with `pip install semantic-kernel "voyageai>=0.4.0"`,
 get an API key as described in [Voyage AI API key and installation](https://docs.voyageai.com/docs/api-key-and-installation), and store it in the `VOYAGE_API_KEY` environment variable.
 
 | Model | Context length (tokens) | Output dimensions |
@@ -888,6 +888,58 @@ async def main() -> None:
     service = kernel.get_service(type=VoyageTextEmbedding)
     embeddings = await service.generate_embeddings(["sample text 1", "sample text 2"])
     print(embeddings.shape)  # (2, 512)
+
+
+asyncio.run(main())
+```
+
+### Contextualized and multimodal embeddings
+
+Voyage AI by MongoDB also offers contextualized embedding models (`voyage-context-4`, and the older `voyage-context-3`) and multimodal embedding models
+(`voyage-multimodal-3.5`, which accepts text, images and video, and the older `voyage-multimodal-3`, which accepts text and images).
+Contextualized embeddings return several chunk vectors for each document, and multimodal inputs aren't plain strings, so these models don't fit `EmbeddingGeneratorBase`,
+which returns one vector for each input string. Call the `voyageai` client directly instead.
+
+For contextualized embeddings, always set `input_type="document"`, `enable_auto_chunking=True` and `chunk_size=32_000` when you embed documents, and pass one string for each document.
+Auto-chunking only works with the `document` input type, and a list of chunk lists is rejected. Queries aren't chunked.
+The response contains the text of every chunk in `chunk_texts`.
+
+```python
+import asyncio
+
+import voyageai
+from PIL import Image
+
+
+async def main() -> None:
+    client = voyageai.AsyncClient()
+
+    # Contextualized embeddings: one string per document, which the API splits into chunks.
+    documents = ["Leafy Inc. reported strong growth. Revenue rose 12% year over year.", "Elephant Ltd. cut costs."]
+    result = await client.contextualized_embed(
+        inputs=documents,
+        model="voyage-context-4",
+        input_type="document",
+        enable_auto_chunking=True,
+        chunk_size=32_000,
+    )
+    for document in result.results:
+        print(document.index, len(document.embeddings), document.chunk_texts)
+
+    # Queries are not chunked: pass a flat list of query strings.
+    query = await client.contextualized_embed(
+        inputs=["How did Leafy Inc. grow?"],
+        model="voyage-context-4",
+        input_type="query",
+    )
+    print(len(query.results[0].embeddings))
+
+    # Multimodal embeddings: each input is a list that mixes text and images.
+    multimodal = await client.multimodal_embed(
+        inputs=[["A red square", Image.new("RGB", (64, 64), "red")]],
+        model="voyage-multimodal-3.5",
+    )
+    print(len(multimodal.embeddings[0]))
 
 
 asyncio.run(main())
